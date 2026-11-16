@@ -1,17 +1,48 @@
-from telegram.ext import Updater, CommandHandler
-import psycopg2
-from psycopg2 import extras
+import os
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tg_bot.settings')
+import django  # type: ignore
+django.setup()
 
-from config import API_TOKEN
+
+from datetime import date, datetime
+
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    ConversationHandler
+    )
+import psycopg2  # type: ignore
+from django.contrib.auth.models import User  # type: ignore
+from django.core.exceptions import ValidationError  # type: ignore
+from psycopg2 import extras
+from config import (
+    API_TOKEN,
+    DB_HOST,
+    DB_PORT,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_USER
+    )
+from tg_bot_calendar.utils import (
+    get_or_create_daily_stats,
+    get_busy_slots,
+    invite_to_event
+    )
+from tg_bot_calendar.models import Event, Appointment
+
 
 # Подключение к БД
 conn = psycopg2.connect(
-    host="localhost",
-    port=5433,
-    database="bot_calendar",
-    user="bot_calendar",
-    password="gn68630s"
+    host=DB_HOST,
+    port=DB_PORT,
+    database=DB_NAME,
+    user=DB_USER,
+    password=DB_PASSWORD,
 )
+
+ASK_DATE, ASK_TIME = range(2)
 
 
 class Calendar:
@@ -59,9 +90,12 @@ class Calendar:
             cur.execute("""
                 INSERT INTO users (telegram_id, username, first_name)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (telegram_id) DO NOTHING;
+                ON CONFLICT (telegram_id) DO NOTHING
+                RETURNING telegram_id;
             """, (telegram_id, username, first_name))
+            row = cur.fetchone()
             self.conn.commit()
+            return row is not None  # True — только что создан
 
     # Проверка, зарегистрирован ли пользователь
     def is_user_registered(self, telegram_id):
@@ -149,24 +183,23 @@ def start(update, context):
         "/list_events\n"
         "/get_event <id>\n"
         "/edit_event <id> <название> <дата> <время> <описание>\n"
-        "/delete_event <id>"
+        "/delete_event <id>\n"
+        "/create_meeting — создать встречу (пошагово)"
     )
 
 
 def register(update, context):
     user = update.effective_user
-    telegram_id = user.id
-    username = user.username
-    first_name = user.first_name
+    is_new = calendar.register_user(user.id, user.username, user.first_name)
 
-    calendar.register_user(telegram_id, username, first_name)
+    if is_new:
+        stats = get_or_create_daily_stats()
+        stats.user_count += 1
+        stats.save()
 
-    if calendar.is_user_registered(telegram_id):
-        update.message.reply_text(
-            "✅ Вы успешно зарегистрированы! Теперь можно создавать события.")
-    else:
-        update.message.reply_text(
-            "⚠️ Произошла ошибка регистрации. Попробуйте позже.")
+    update.message.reply_text(
+        "✅ Вы зарегистрированы! Теперь можно создавать события."
+        )
 
 
 def create_event_handler(update, context):
@@ -194,6 +227,11 @@ def create_event_handler(update, context):
     try:
         event_id = calendar.create_event(user.id, name, date, time, details)
         if event_id is not None:
+            # Обновляем статистику в Django
+            stats = get_or_create_daily_stats()
+            stats.event_count += 1
+            stats.save()
+
             update.message.reply_text(f"✅ Событие создано. ID: {event_id}")
         else:
             update.message.reply_text("❌ Не удалось создать событие.")
@@ -290,6 +328,11 @@ def edit_event_handler(update, context):
 
     success = calendar.edit_event(event_id, user.id, name, date, time, details)
     if success:
+        # Обновляем статистику
+        stats = get_or_create_daily_stats()
+        stats.edited_events += 1
+        stats.save()
+
         update.message.reply_text(f"✅ Событие с ID {event_id} обновлено.")
     else:
         update.message.reply_text(
@@ -317,15 +360,255 @@ def delete_event_handler(update, context):
 
     success = calendar.delete_event(event_id, user.id)
     if success:
+        # Обновляем статистику
+        stats = get_or_create_daily_stats()
+        stats.cancelled_events += 1
+        stats.save()
+
         update.message.reply_text(f"✅ Событие с ID {event_id} удалено.")
     else:
         update.message.reply_text(
             f"❌ Событие с ID {event_id} не найдено или не принадлежит вам.")
 
 
+def check_slots_handler(update, context):
+    user = update.effective_user
+
+    # Находим Django User по username (для теста)
+    try:
+        django_user = (User.objects.get(username=user.username)
+                       if user.username else User.objects.first())
+    except User.DoesNotExist:
+        django_user = User.objects.first()  # Фоллбэк для теста
+
+    today = date.today()
+    slots = get_busy_slots(django_user, today)
+
+    if not slots:
+        update.message.reply_text(
+            "На сегодня у вас нет запланированных встреч."
+            )
+        return
+
+    text = "📅 Ваши занятые слоты на сегодня:\n"
+    for start, end in slots:
+        text += f"- {start}\n"
+
+    update.message.reply_text(text)
+
+
+def create_meeting_start(update, context):
+    """Точка входа: /create_meeting — спрашиваем дату."""
+    update.message.reply_text(
+        "📅 Давайте создадим встречу!\n\n"
+        "Шаг 1 из 2.\n"
+        "Введите дату в формате ГГГГ-ММ-ДД (например 2026-12-25).\n"
+        "Для отмены: /cancel"
+    )
+    return ASK_DATE
+
+
+def ask_date(update, context):
+    """Получаем и проверяем дату."""
+    text = (update.message.text or "").strip()
+
+    try:
+        meeting_date = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        update.message.reply_text(
+            "❌ Не понял дату."
+            "Введите в формате ГГГГ-ММ-ДД, например 2026-12-25."
+        )
+        return ASK_DATE
+
+    if meeting_date < date.today():
+        update.message.reply_text(
+            "❌ Эта дата уже прошла."
+            "Введите будущую дату."
+            )
+        return ASK_DATE
+
+    context.user_data["meeting_date"] = meeting_date
+
+    update.message.reply_text(
+        f"✅ Дата принята: {meeting_date.strftime('%d.%m.%Y')}\n\n"
+        "Шаг 2 из 2. Введите время в формате ЧЧ:ММ (например 14:30).\n"
+        "Для отмены: /cancel"
+    )
+    return ASK_TIME
+
+
+def ask_time(update, context):
+    """Получаем время и создаём встречу."""
+    text = (update.message.text or "").strip()
+
+    try:
+        meeting_time = datetime.strptime(text, "%H:%M").time()
+    except ValueError:
+        update.message.reply_text(
+            "❌ Не понял время. Введите в формате ЧЧ:ММ, например 14:30."
+        )
+        return ASK_TIME
+
+    meeting_date = context.user_data.get("meeting_date")
+    user = update.effective_user
+
+    # Находим Django-пользователя (та же логика, что в check_slots_handler)
+    try:
+        django_user = (
+            User.objects.get(username=user.username)
+            if user.username else User.objects.first()
+        )
+    except User.DoesNotExist:
+        django_user = User.objects.first()
+
+    if django_user is None:
+        update.message.reply_text(
+            "❌ В системе нет пользователя."
+            "Сначала зарегистрируйте его через Django-админку."
+            )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Создаём событие под конкретную дату и время — без get_or_create по имени,
+    # чтобы не переиспользовать старое событие с другой датой
+    event = Event.objects.create(
+        name=f"Встреча {user.first_name or user.username or user.id} "
+             f"{meeting_date.strftime('%d.%m.%Y')} в {text}",
+        date=meeting_date,
+        time=meeting_time,
+    )
+
+    try:
+        appointment = invite_to_event(
+            organizer_user=django_user,
+            participant_user=django_user,  # пока участник = организатор
+            event=event,
+            date=meeting_date,
+            time=meeting_time,
+            details=f"Создано через Telegram-бот, telegram_id={user.id}",
+            participant_telegram_id=user.id,
+        )
+        update.message.reply_text(
+            f"✅ Встреча создана!\n"
+            f"📅 {meeting_date.strftime('%d.%m.%Y')} в "
+            f"{meeting_time.strftime('%H:%M')}\n"
+            f"Статус: {appointment.status}."
+        )
+    except ValidationError as e:
+        # Занятость проверяется внутри invite_to_event
+        update.message.reply_text(
+            f"❌ Ошибка:{e.message if hasattr(e, 'message') else e}"
+            )
+    except Exception as e:
+        print(e)
+        update.message.reply_text("Произошла ошибка при создании встречи.")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def cancel_meeting(update, context):
+    update.message.reply_text("❌ Создание встречи отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def invite_test_handler(update, context):
+    user = update.effective_user
+    try:
+        django_user = (User.objects.get(username=user.username)
+                       if user.username else User.objects.first())
+    except User.DoesNotExist:
+        django_user = User.objects.first()
+
+    # Берём первое событие из базы (или создаём тестовое, если пусто)
+    event, _ = Event.objects.get_or_create(
+        name="Тестовая встреча",
+        defaults={'date': datetime.now().date(),
+                  'time': datetime.strptime("14:00", "%H:%M").time()}
+    )
+
+    test_date = datetime.now().date()
+    test_time = datetime.strptime("14:00", "%H:%M").time()
+
+    try:
+        print(f"DEBUG: user.id = {user.id}, user.username = {user.username}")
+        invite_to_event(
+            organizer_user=django_user,
+            participant_user=django_user,  # Для теста участник = организатор
+            event=event,
+            date=test_date,
+            time=test_time,
+            details="Тестовая запись",
+            participant_telegram_id=user.id
+        )
+        update.message.reply_text("✅ Встреча создана! Статус: ожидается.")
+    except ValidationError as e:
+        update.message.reply_text(f"❌ Ошибка: {e}")
+    except Exception as e:
+        print(e)
+        update.message.reply_text("Произошла ошибка при создании встречи.")
+
+
+def accept_appointment_handler(update, context):
+    user = update.effective_user
+    if not user or not user.id:
+        update.message.reply_text("❌ Не удалось получить ваш ID.")
+        return
+
+    pending = Appointment.objects.filter(
+        telegram_id=user.id,
+        status='ожидается'
+    ).order_by('-id')
+
+    if not pending.exists():
+        update.message.reply_text(
+            "У вас нет приглашений, ожидающих подтверждения.")
+        return
+
+    appt = pending.first()
+    appt.status = 'подтверждено'
+    appt.save()
+
+    update.message.reply_text(f"✅ Вы подтвердили встречу: «{appt.event.name}»"
+                              f"на {appt.date} в {appt.time}")
+
+
+def decline_appointment_handler(update, context):
+    user = update.effective_user
+    pending = Appointment.objects.filter(
+        telegram_id=user.id,
+        status='ожидается'
+    ).order_by('-id')
+
+    if not pending.exists():
+        update.message.reply_text(
+            "У вас нет приглашений, ожидающих подтверждения."
+            )
+        return
+
+    appt = pending.first()
+    appt.status = 'отменено'
+    appt.save()
+    update.message.reply_text(f"❌ Вы отклонили встречу: «{appt.event.name}»")
+
+
 def main():
     updater = Updater(token=API_TOKEN)
     dispatcher = updater.dispatcher
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("create_meeting", create_meeting_start)],
+        states={
+            ASK_DATE: [MessageHandler(Filters.text & ~Filters.command,
+                                      ask_date)],
+            ASK_TIME: [MessageHandler(Filters.text & ~Filters.command,
+                                      ask_time)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_meeting)],
+    )
+    dispatcher.add_handler(conv_handler)
 
     dispatcher.add_handler(CommandHandler('start', start))
     dispatcher.add_handler(CommandHandler('register', register))
@@ -336,6 +619,12 @@ def main():
     dispatcher.add_handler(CommandHandler('edit_event', edit_event_handler))
     dispatcher.add_handler(CommandHandler(
         'delete_event', delete_event_handler))
+    dispatcher.add_handler(CommandHandler('check_slots', check_slots_handler))
+    dispatcher.add_handler(CommandHandler('invite_test', invite_test_handler))
+    dispatcher.add_handler(CommandHandler('accept',
+                                          accept_appointment_handler))
+    dispatcher.add_handler(CommandHandler('decline',
+                                          decline_appointment_handler))
 
     updater.start_polling()
     updater.idle()
