@@ -68,6 +68,7 @@ def invite_to_event(
 
     # 2. Создаём встречу
     appointment = Appointment.objects.create(
+        organizer=organizer_user,
         user=participant_user,
         event=event,
         date=date,
@@ -76,5 +77,4 @@ def invite_to_event(
         status='ожидается',
         telegram_id=participant_telegram_id
     )
-    print(f"DEBUG: created appointment id={appointment.id}, telegram_id={appointment.telegram_id}")
     return appointment

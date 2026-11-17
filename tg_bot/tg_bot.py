@@ -42,7 +42,7 @@ conn = psycopg2.connect(
     password=DB_PASSWORD,
 )
 
-ASK_DATE, ASK_TIME = range(2)
+ASK_DATE, ASK_TIME, ASK_PARTICIPANT = range(3)
 
 
 class Calendar:
@@ -184,7 +184,7 @@ def start(update, context):
         "/get_event <id>\n"
         "/edit_event <id> <название> <дата> <время> <описание>\n"
         "/delete_event <id>\n"
-        "/create_meeting — создать встречу (пошагово)"
+        "/create_meeting — создать встречу (дата, время, участник)"
     )
 
 
@@ -439,7 +439,7 @@ def ask_date(update, context):
 
 
 def ask_time(update, context):
-    """Получаем время и создаём встречу."""
+    """Получаем время и переходим к выбору участника."""
     text = (update.message.text or "").strip()
 
     try:
@@ -450,59 +450,99 @@ def ask_time(update, context):
         )
         return ASK_TIME
 
-    meeting_date = context.user_data.get("meeting_date")
+    context.user_data["meeting_time"] = meeting_time
+
+    update.message.reply_text(
+        "✅ Время принято.\n\n"
+        "👥 Введите @username участника (например @ivan_petrov).\n"
+        "Если встреча только для вас — введите: я\n"
+        "Для отмены: /cancel"
+    )
+    return ASK_PARTICIPANT
+
+
+def ask_participant(update, context):
+    """Получаем участника и создаём встречу."""
+    text = (update.message.text or "").strip()
     user = update.effective_user
 
-    # Находим Django-пользователя (та же логика, что в check_slots_handler)
+    # Организатор — тот, кто запустил команду
     try:
-        django_user = (
+        organizer = (
             User.objects.get(username=user.username)
             if user.username else User.objects.first()
         )
     except User.DoesNotExist:
-        django_user = User.objects.first()
+        organizer = User.objects.first()
 
-    if django_user is None:
+    if organizer is None:
         update.message.reply_text(
-            "❌ В системе нет пользователя."
-            "Сначала зарегистрируйте его через Django-админку."
-            )
+            "❌ Ваш аккаунт не найден в системе. Обратитесь к администратору."
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Создаём событие под конкретную дату и время — без get_or_create по имени,
-    # чтобы не переиспользовать старое событие с другой датой
+    # Выбор участника: «я» или @username
+    if text.lower() == "я":
+        participant = organizer
+        participant_tg_id = user.id
+    else:
+        participant_username = text.lstrip("@")
+        try:
+            participant = User.objects.get(username=participant_username)
+        except User.DoesNotExist:
+            update.message.reply_text(
+                "❌ Пользователь не найден."
+                "Проверьте @username и попробуйте снова.\n"
+                "Для отмены: /cancel"
+            )
+            return ASK_PARTICIPANT
+        # Telegram ID участника пока неизвестен — оставляем пустым,
+        # участник подтвердит встречу сам через /accept
+        participant_tg_id = None
+
+    meeting_date = context.user_data.get("meeting_date")
+    meeting_time = context.user_data.get("meeting_time")
+
+    # Создаём событие под конкретную дату и время
     event = Event.objects.create(
-        name=f"Встреча {user.first_name or user.username or user.id} "
-             f"{meeting_date.strftime('%d.%m.%Y')} в {text}",
+        name=f"Встреча: {organizer.username} — {participant.username}",
         date=meeting_date,
         time=meeting_time,
     )
 
     try:
         appointment = invite_to_event(
-            organizer_user=django_user,
-            participant_user=django_user,  # пока участник = организатор
+            organizer_user=organizer,
+            participant_user=participant,
             event=event,
             date=meeting_date,
             time=meeting_time,
-            details=f"Создано через Telegram-бот, telegram_id={user.id}",
-            participant_telegram_id=user.id,
+            details=f"Приглашение от {organizer.username}",
+            participant_telegram_id=participant_tg_id,
         )
         update.message.reply_text(
             f"✅ Встреча создана!\n"
             f"📅 {meeting_date.strftime('%d.%m.%Y')} в "
             f"{meeting_time.strftime('%H:%M')}\n"
+            f"👥 Организатор: {organizer.username}\n"
+            f"👥 Участник: {participant.username}\n"
             f"Статус: {appointment.status}."
         )
     except ValidationError as e:
-        # Занятость проверяется внутри invite_to_event
+        # Слот участника занят — удаляем ненужное событие
+        event.delete()
         update.message.reply_text(
-            f"❌ Ошибка:{e.message if hasattr(e, 'message') else e}"
+            f"❌ Ошибка: {e.message if hasattr(e, 'message') else e}"
             )
+        context.user_data.clear()
+        return ConversationHandler.END
     except Exception as e:
         print(e)
+        event.delete()
         update.message.reply_text("Произошла ошибка при создании встречи.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -605,6 +645,8 @@ def main():
                                       ask_date)],
             ASK_TIME: [MessageHandler(Filters.text & ~Filters.command,
                                       ask_time)],
+            ASK_PARTICIPANT: [MessageHandler(Filters.text & ~Filters.command,
+                                             ask_participant)]
         },
         fallbacks=[CommandHandler("cancel", cancel_meeting)],
     )
