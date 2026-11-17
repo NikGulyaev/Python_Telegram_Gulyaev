@@ -390,11 +390,13 @@ def check_slots_handler(update, context):
             )
         return
 
-    text = "📅 Ваши занятые слоты на сегодня:\n"
-    for start, end in slots:
-        text += f"- {start}\n"
+    lines = ["📅 Ваши занятые слоты на сегодня:"]
+    for start_time, end_time in slots:
+        lines.append(
+            f"- {start_time.strftime('%H:%M')} — {end_time.strftime('%H:%M')}"
+        )
 
-    update.message.reply_text(text)
+    update.message.reply_text("\n".join(lines))
 
 
 def create_meeting_start(update, context):

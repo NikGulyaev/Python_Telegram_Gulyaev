@@ -43,9 +43,7 @@ def get_busy_slots(user, target_date):
         start_time = appt.time
 
         # Конец: +1 час к дате+времени встречи
-        end_datetime = datetime.combine(
-            (target_date, start_time) + timedelta(hours=1)
-            )
+        end_datetime = datetime.combine(target_date, start_time) + timedelta(hours=1)
         end_time = end_datetime.time()
 
         slots.append((start_time, end_time))
