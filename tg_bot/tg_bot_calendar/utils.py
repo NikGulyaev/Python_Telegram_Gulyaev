@@ -1,4 +1,4 @@
-# bot_stats/utils.py
+from datetime import datetime, timedelta
 from django.utils import timezone  # type: ignore
 from django.core.exceptions import ValidationError  # type: ignore
 from .models import Appointment, BotStatistics
@@ -27,19 +27,27 @@ def get_user_appointments(user):
 
 def get_busy_slots(user, target_date):
     """
-    Возвращает список кортежей (время начала, время конца) для данного
-    пользователя на указанную дату. Для простоты считаем,
-    что каждая встреча длится 1 час.
+    Возвращает список кортежей (start_time, end_time) для всех подтверждённых
+    или ожидающих встреч пользователя на указанную дату.
+    Длительность встречи — 1 час.
     """
     appointments = Appointment.objects.filter(
         user=user,
-        date=target_date
+        date=target_date,
+        status__in=["ожидается", "подтверждено"],
     )
 
     slots = []
     for appt in appointments:
+        # Начало: время встречи
         start_time = appt.time
-        end_time = start_time
+
+        # Конец: +1 час к дате+времени встречи
+        end_datetime = datetime.combine(
+            (target_date, start_time) + timedelta(hours=1)
+            )
+        end_time = end_datetime.time()
+
         slots.append((start_time, end_time))
 
     return slots
