@@ -1,5 +1,10 @@
 from django.contrib import admin  # type: ignore
-from tg_bot_calendar.models import Appointment, BotStatistics, Event
+from tg_bot_calendar.models import (
+    Appointment,
+    BotStatistics,
+    Event,
+    TelegramProfile,
+)
 
 
 @admin.register(BotStatistics)
@@ -23,3 +28,9 @@ class AppointmentAdmin(admin.ModelAdmin):
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
     list_display = ('name', 'date', 'time')
+
+
+@admin.register(TelegramProfile)
+class TelegramProfileAdmin(admin.ModelAdmin):
+    list_display = ("user", "telegram_id", "username", "first_name")
+    search_fields = ("user__username", "username")

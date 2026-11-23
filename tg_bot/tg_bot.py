@@ -28,9 +28,10 @@ from config import (
 from tg_bot_calendar.utils import (
     get_or_create_daily_stats,
     get_busy_slots,
-    invite_to_event
+    invite_to_event,
+    get_django_user_by_telegram_id
     )
-from tg_bot_calendar.models import Event, Appointment
+from tg_bot_calendar.models import Event, Appointment, TelegramProfile
 
 
 # Подключение к БД
@@ -42,7 +43,7 @@ conn = psycopg2.connect(
     password=DB_PASSWORD,
 )
 
-ASK_DATE, ASK_TIME, ASK_PARTICIPANT = range(3)
+ASK_DATE, ASK_TIME, ASK_PARTICIPANT, ASK_LOGIN = range(4)
 
 
 class Calendar:
@@ -188,18 +189,88 @@ def start(update, context):
     )
 
 
-def register(update, context):
+def register_start(update, context):
+    """Запрашивает логин Django-пользователя."""
     user = update.effective_user
-    is_new = calendar.register_user(user.id, user.username, user.first_name)
-
-    if is_new:
-        stats = get_or_create_daily_stats()
-        stats.user_count += 1
-        stats.save()
+    # Проверяем, есть ли уже профиль — если да, сразу говорим, что всё ок
+    try:
+        TelegramProfile.objects.get(telegram_id=user.id)
+        update.message.reply_text("✅ Ваш профиль уже зарегистрирован.")
+        return ConversationHandler.END
+    except TelegramProfile.DoesNotExist:
+        pass
 
     update.message.reply_text(
-        "✅ Вы зарегистрированы! Теперь можно создавать события."
-        )
+        "Введите логин вашего Django-аккаунта (например, admin):"
+    )
+    return ASK_LOGIN
+
+
+def register_save_login(update, context):
+    """Сохраняет профиль, привязывая telegram_id к указанному логину."""
+    user = update.effective_user
+    raw_login = (update.message.text or "").strip()
+    login = raw_login.lstrip("@")  # на всякий случай убираем @
+
+    if not login:
+        update.message.reply_text("❌ Логин не может быть пустым. Попробуйте ещё раз или /cancel.")
+        return ASK_LOGIN
+
+    try:
+        django_user = User.objects.get(username=login)
+    except User.DoesNotExist:
+        update.message.reply_text(f"❌ Пользователь с логином «{login}» не найден. Попробуйте ещё раз или /cancel.")
+        return ASK_LOGIN
+
+    # Создаём или обновляем профиль
+    profile, created = TelegramProfile.objects.update_or_create(
+        user=django_user,
+        defaults={
+            "telegram_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+        },
+    )
+
+    if created:
+        msg = "✅ Профиль успешно создан."
+    else:
+        msg = "🔄 Профиль обновлён."
+
+    update.message.reply_text(msg)
+    return ConversationHandler.END
+
+
+def register_handler(update, context):
+    user = update.effective_user
+    if not user:
+        return ConversationHandler.END
+
+    try:
+        django_user = User.objects.get(username=user.username)
+    except User.DoesNotExist:
+        update.message.reply_text(
+            "❌ Ваш аккаунт не найден в системе. Обратитесь к администратору."
+            )
+        return ConversationHandler.END
+
+    # Создаём или обновляем профиль
+    profile, created = TelegramProfile.objects.update_or_create(
+        user=django_user,
+        defaults={
+            "telegram_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+        },
+    )
+
+    if created:
+        msg = "✅ Вы зарегистрированы в системе."
+    else:
+        msg = "🔄 Ваш профиль обновлён."
+
+    update.message.reply_text(msg)
+    return ConversationHandler.END
 
 
 def create_event_handler(update, context):
@@ -464,49 +535,52 @@ def ask_time(update, context):
 
 
 def ask_participant(update, context):
-    """Получаем участника и создаём встречу."""
+    """Получаем участника и создаём встречу, используя TelegramProfile для привязки."""
     text = (update.message.text or "").strip()
     user = update.effective_user
 
-    # Организатор — тот, кто запустил команду
-    try:
-        organizer = (
-            User.objects.get(username=user.username)
-            if user.username else User.objects.first()
-        )
-    except User.DoesNotExist:
-        organizer = User.objects.first()
+    # 1. Получаем организатора через профиль по telegram_id
+    # Это работает даже если у пользователя нет username в Telegram
+    organizer = get_django_user_by_telegram_id(user.id)
 
     if organizer is None:
         update.message.reply_text(
-            "❌ Ваш аккаунт не найден в системе. Обратитесь к администратору."
+            "❌ Ваш профиль не зарегистрирован. Сначала выполните /register и укажите логин (например, admin)."
         )
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Выбор участника: «я» или @username
+    # 2. Выбор участника: «я» или @username
     if text.lower() == "я":
         participant = organizer
+        # Если участник — это сам организатор, его telegram_id точно есть
         participant_tg_id = user.id
     else:
         participant_username = text.lstrip("@")
+
+        # Ищем Django-пользователя по логину (как раньше), но теперь это только для поиска участника,
+        # а не для привязки к боту.
         try:
             participant = User.objects.get(username=participant_username)
         except User.DoesNotExist:
             update.message.reply_text(
-                "❌ Пользователь не найден."
-                "Проверьте @username и попробуйте снова.\n"
-                "Для отмены: /cancel"
+                f"❌ Пользователь с логином «{participant_username}» не найден.\n"
+                "Проверьте правильность написания или используйте «я» для себя."
             )
             return ASK_PARTICIPANT
-        # Telegram ID участника пока неизвестен — оставляем пустым,
-        # участник подтвердит встречу сам через /accept
-        participant_tg_id = None
+
+        # Пытаемся найти telegram_id участника через его профиль
+        # Если профиля нет — участник не регистрировался, уведомления ему не придут
+        try:
+            profile = TelegramProfile.objects.get(user=participant)
+            participant_tg_id = profile.telegram_id
+        except TelegramProfile.DoesNotExist:
+            participant_tg_id = None
 
     meeting_date = context.user_data.get("meeting_date")
     meeting_time = context.user_data.get("meeting_time")
 
-    # Создаём событие под конкретную дату и время
+    # Создаём событие
     event = Event.objects.create(
         name=f"Встреча: {organizer.username} — {participant.username}",
         date=meeting_date,
@@ -522,21 +596,28 @@ def ask_participant(update, context):
             time=meeting_time,
             details=f"Приглашение от {organizer.username}",
             participant_telegram_id=participant_tg_id,
+            bot=context.bot,
         )
-        update.message.reply_text(
+
+        msg = (
             f"✅ Встреча создана!\n"
-            f"📅 {meeting_date.strftime('%d.%m.%Y')} в "
-            f"{meeting_time.strftime('%H:%M')}\n"
+            f"📅 {meeting_date.strftime('%d.%m.%Y')} в {meeting_time.strftime('%H:%M')}\n"
             f"👥 Организатор: {organizer.username}\n"
             f"👥 Участник: {participant.username}\n"
-            f"Статус: {appointment.status}."
+            f"📋 Статус: {appointment.status}"
         )
+
+        if participant_tg_id:
+            msg += "\n📩 Участнику отправлено приглашение."
+        else:
+            msg += "\n⚠️ У участника нет профиля — уведомление не отправлено."
+
+        update.message.reply_text(msg)
+
     except ValidationError as e:
-        # Слот участника занят — удаляем ненужное событие
         event.delete()
-        update.message.reply_text(
-            f"❌ Ошибка: {e.message if hasattr(e, 'message') else e}"
-            )
+        error_text = e.message if hasattr(e, 'message') else str(e)
+        update.message.reply_text(f"❌ Ошибка: {error_text}")
         context.user_data.clear()
         return ConversationHandler.END
     except Exception as e:
@@ -554,43 +635,6 @@ def cancel_meeting(update, context):
     update.message.reply_text("❌ Создание встречи отменено.")
     context.user_data.clear()
     return ConversationHandler.END
-
-
-def invite_test_handler(update, context):
-    user = update.effective_user
-    try:
-        django_user = (User.objects.get(username=user.username)
-                       if user.username else User.objects.first())
-    except User.DoesNotExist:
-        django_user = User.objects.first()
-
-    # Берём первое событие из базы (или создаём тестовое, если пусто)
-    event, _ = Event.objects.get_or_create(
-        name="Тестовая встреча",
-        defaults={'date': datetime.now().date(),
-                  'time': datetime.strptime("14:00", "%H:%M").time()}
-    )
-
-    test_date = datetime.now().date()
-    test_time = datetime.strptime("14:00", "%H:%M").time()
-
-    try:
-        print(f"DEBUG: user.id = {user.id}, user.username = {user.username}")
-        invite_to_event(
-            organizer_user=django_user,
-            participant_user=django_user,  # Для теста участник = организатор
-            event=event,
-            date=test_date,
-            time=test_time,
-            details="Тестовая запись",
-            participant_telegram_id=user.id
-        )
-        update.message.reply_text("✅ Встреча создана! Статус: ожидается.")
-    except ValidationError as e:
-        update.message.reply_text(f"❌ Ошибка: {e}")
-    except Exception as e:
-        print(e)
-        update.message.reply_text("Произошла ошибка при создании встречи.")
 
 
 def accept_appointment_handler(update, context):
@@ -654,8 +698,18 @@ def main():
     )
     dispatcher.add_handler(conv_handler)
 
+    register_conv = ConversationHandler(
+        entry_points=[CommandHandler("register", register_start)],
+        states={
+            ASK_LOGIN: [
+                MessageHandler(Filters.text & ~Filters.command, register_save_login)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_meeting)],  # важно: используй тот же cancel, что и у create_meeting
+    )
+    dispatcher.add_handler(register_conv)
+
     dispatcher.add_handler(CommandHandler('start', start))
-    dispatcher.add_handler(CommandHandler('register', register))
     dispatcher.add_handler(CommandHandler(
         'create_event', create_event_handler))
     dispatcher.add_handler(CommandHandler('list_events', list_events_handler))
@@ -664,7 +718,6 @@ def main():
     dispatcher.add_handler(CommandHandler(
         'delete_event', delete_event_handler))
     dispatcher.add_handler(CommandHandler('check_slots', check_slots_handler))
-    dispatcher.add_handler(CommandHandler('invite_test', invite_test_handler))
     dispatcher.add_handler(CommandHandler('accept',
                                           accept_appointment_handler))
     dispatcher.add_handler(CommandHandler('decline',

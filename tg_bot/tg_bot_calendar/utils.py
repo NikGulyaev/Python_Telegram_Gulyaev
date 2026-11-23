@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta
 from django.utils import timezone  # type: ignore
 from django.core.exceptions import ValidationError  # type: ignore
-from .models import Appointment, BotStatistics
+from telegram import Bot
+from .models import Appointment, BotStatistics, TelegramProfile
+
+
+MEETING_DURATION = timedelta(hours=1)
 
 
 def get_or_create_daily_stats():
@@ -52,27 +56,48 @@ def get_busy_slots(user, target_date):
 
 
 def invite_to_event(
-        organizer_user, participant_user, event, date, time,
-        details="", participant_telegram_id=None
-        ):
+    organizer_user,
+    participant_user,
+    event,
+    date,
+    time,
+    details="",
+    participant_telegram_id=None,
+    bot=None,
+):
     """
     Приглашает пользователя на событие.
-    1. Проверяет, нет ли у участника встречи на эту дату и время.
+    1. Проверяет пересечение интервалов занятости участника.
     2. Если свободно — создаёт встречу со статусом 'ожидается'.
-    3. Если занято — выбрасывает ошибку.
+    3. Отправляет участнику уведомление, если у него есть профиль.
     """
-    # 1. Проверка занятости: ищем встречи участника на эту дату и время
-    existing = Appointment.objects.filter(
+    # 1. Проверка занятости: пересечение интервалов, отменённые не считаем
+    new_start = datetime.combine(date, time)
+    new_end = new_start + MEETING_DURATION
+
+    for appt in Appointment.objects.filter(
         user=participant_user,
         date=date,
-        time=time
-    )
+        status__in=["ожидается", "подтверждено"],
+    ):
+        appt_start = datetime.combine(appt.date, appt.time)
+        appt_end = appt_start + MEETING_DURATION
+        if new_start < appt_end and new_end > appt_start:
+            raise ValidationError(
+                f"Пользователь {participant_user.username} занят "
+                f"с {appt_start.strftime('%H:%M')} "
+                f"до {appt_end.strftime('%H:%M')}!"
+            )
 
-    if existing.exists():
-        raise ValidationError(f"Пользователь {participant_user.username}"
-                              f" уже занят в это время!")
+    # 2. Создаём встречу. telegram_id берём из профиля, если он есть
+    telegram_id = participant_telegram_id
+    profile = None
+    try:
+        profile = TelegramProfile.objects.get(user=participant_user)
+        telegram_id = profile.telegram_id
+    except TelegramProfile.DoesNotExist:
+        pass
 
-    # 2. Создаём встречу
     appointment = Appointment.objects.create(
         organizer=organizer_user,
         user=participant_user,
@@ -80,7 +105,53 @@ def invite_to_event(
         date=date,
         time=time,
         details=details,
-        status='ожидается',
-        telegram_id=participant_telegram_id
+        status="ожидается",
+        telegram_id=telegram_id,
     )
+
+    # 3. Уведомление участнику (если он регистрировался и мы можем написать)
+    if bot and profile:
+        notify_participant_about_invitation(
+            bot=bot,
+            participant_profile=profile,   # ✅ исправлено: имя параметра совпадает с сигнатурой
+            event_name=event.name,
+            date=date,
+            time=time,
+        )
+
     return appointment
+
+
+def notify_participant_about_invitation(
+    bot: Bot,
+    participant_profile: TelegramProfile,
+    event_name: str,
+    date,
+    time,
+):
+    """
+    Отправляет участнику сообщение о приглашении.
+    """
+    text = (
+        f"📅 Вас пригласили на встречу:\n\n"
+        f"«{event_name}»\n"
+        f"🗓 Дата: {date.strftime('%d.%m.%Y')}\n"
+        f"⏰ Время: {time.strftime('%H:%M')}\n\n"
+        f"Чтобы подтвердить встречу, нажмите /accept\n"
+        f"Чтобы отклонить — /decline"
+    )
+    try:
+        bot.send_message(chat_id=participant_profile.telegram_id, text=text)
+        return True
+    except Exception as e:
+        # Сюда можно добавить логирование
+        print(f"Не удалось отправить уведомление: {e}")
+        return False
+
+
+def get_django_user_by_telegram_id(telegram_id):
+    try:
+        profile = TelegramProfile.objects.get(telegram_id=telegram_id)
+        return profile.user
+    except TelegramProfile.DoesNotExist:
+        return None
