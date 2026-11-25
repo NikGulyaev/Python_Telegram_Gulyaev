@@ -3,7 +3,7 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tg_bot.settings')
 import django  # type: ignore
 django.setup()
 
-
+import logging
 from datetime import date, datetime
 from telegram import Update
 from telegram.ext import (
@@ -12,7 +12,7 @@ from telegram.ext import (
     MessageHandler,
     Filters,
     ConversationHandler,
-    CallbackContext
+    CallbackContext,
     )
 import psycopg2  # type: ignore
 from django.contrib.auth.models import User  # type: ignore
@@ -36,6 +36,7 @@ from tg_bot_calendar.utils import (
     increment_cancelled,
     increment_created,
     increment_edited,
+    MEETING_DURATION,
     )
 from tg_bot_calendar.models import Event, Appointment, TelegramProfile
 
@@ -380,50 +381,85 @@ def get_event_handler(update, context):
 
 def edit_event_handler(update, context):
     user = update.effective_user
-    if not calendar.is_user_registered(user.id):
-        update.message.reply_text(
-            "❌ Сначала зарегистрируйтесь командой /register.")
-        return
 
     text = update.message.text or ""
     parts = text.split()
     if len(parts) < 6:
         update.message.reply_text(
-            "Формат: /edit_event <id> <название>"
-            "<дата(YYYY-MM-DD)> <время(HH:MM)> <описание>"
+            "Формат: /edit_event <id> <название> <дата(YYYY-MM-DD)> <время(HH:MM)> <описание>"
         )
         return
 
     try:
-        event_id = int(parts[1])
+        appointment_id = int(parts[1])
     except ValueError:
         update.message.reply_text("ID должен быть целым числом.")
         return
 
+    try:
+        appt = Appointment.objects.select_related("event").get(id=appointment_id)
+    except Appointment.DoesNotExist:
+        update.message.reply_text(f"❌ Встреча с ID {appointment_id} не найдена.")
+        return
+
+    # Проверка прав: только организатор или участник
+    if not can_manage_appointment(appt, user.id):
+        update.message.reply_text("❌ Вы не можете редактировать чужую встречу.")
+        return
+
+    # Разбор новых значений
     name = parts[2]
-    date = parts[3]
-    time = parts[4]
+    try:
+        new_date = datetime.strptime(parts[3], "%Y-%m-%d").date()
+        new_time = datetime.strptime(parts[4], "%H:%M").time()
+    except ValueError:
+        update.message.reply_text("❌ Неверный формат даты/времени. Пример: 2026-12-01 14:30")
+        return
     details = " ".join(parts[5:])
 
-    success = calendar.edit_event(event_id, user.id, name, date, time, details)
-    if success:
-        # Обновляем статистику
-        stats = get_or_create_daily_stats()
-        stats.edited_events += 1
-        stats.save()
+    # Если меняется дата/время — проверяем, не занят ли новый слот участника
+    if new_date != appt.date or new_time != appt.time:
+        new_start = datetime.combine(new_date, new_time)
+        new_end = new_start + MEETING_DURATION
+        for other in Appointment.objects.filter(
+            user=appt.user,
+            date=new_date,
+            status__in=["ожидается", "подтверждено"],
+        ).exclude(id=appt.id):
+            other_start = datetime.combine(other.date, other.time)
+            other_end = other_start + MEETING_DURATION
+            if new_start < other_end and new_end > other_start:
+                update.message.reply_text(
+                    f"❌ Участник {appt.user.username} уже занят "
+                    f"с {other_start.strftime('%H:%M')} до {other_end.strftime('%H:%M')} {new_date.strftime('%d.%m.%Y')}."
+                )
+                return
 
-        update.message.reply_text(f"✅ Событие с ID {event_id} обновлено.")
-    else:
-        update.message.reply_text(
-            f"❌ Событие с ID {event_id} не найдено или не принадлежит вам.")
+    # Применяем изменения
+    appt.event.name = name
+    appt.event.date = new_date
+    appt.event.time = new_time
+    appt.event.save()
+
+    appt.date = new_date
+    appt.time = new_time
+    appt.details = details
+    appt.save()
+
+    # Статистика: редактирование засчитываем тому, кто его сделал
+    editor = get_django_user_by_telegram_id(user.id)
+    if editor:
+        increment_edited(editor)
+
+    update.message.reply_text(
+        f"✅ Встреча ID {appointment_id} обновлена:\n"
+        f"📅 {new_date.strftime('%d.%m.%Y')} в {new_time.strftime('%H:%M')}\n"
+        f"📝 {name} — {details}"
+    )
 
 
 def delete_event_handler(update, context):
     user = update.effective_user
-    if not calendar.is_user_registered(user.id):
-        update.message.reply_text(
-            "❌ Сначала зарегистрируйтесь командой /register.")
-        return
 
     text = update.message.text or ""
     parts = text.split()
@@ -432,22 +468,30 @@ def delete_event_handler(update, context):
         return
 
     try:
-        event_id = int(parts[1])
+        appointment_id = int(parts[1])
     except ValueError:
         update.message.reply_text("ID должен быть целым числом.")
         return
 
-    success = calendar.delete_event(event_id, user.id)
-    if success:
-        # Обновляем статистику
-        stats = get_or_create_daily_stats()
-        stats.cancelled_events += 1
-        stats.save()
+    try:
+        appt = Appointment.objects.get(id=appointment_id)
+    except Appointment.DoesNotExist:
+        update.message.reply_text(f"❌ Встреча с ID {appointment_id} не найдена.")
+        return
 
-        update.message.reply_text(f"✅ Событие с ID {event_id} удалено.")
-    else:
-        update.message.reply_text(
-            f"❌ Событие с ID {event_id} не найдено или не принадлежит вам.")
+    # Проверка прав
+    if not can_manage_appointment(appt, user.id):
+        update.message.reply_text("❌ Вы не можете удалять чужую встречу.")
+        return
+
+    # Статистика до удаления (потому что после delete объект уже не живой)
+    increment_cancelled(appt.user)
+
+    event = appt.event
+    appt.delete()
+    event.delete()  # событие без встреч нам больше не нужно
+
+    update.message.reply_text(f"✅ Встреча ID {appointment_id} удалена.")
 
 
 def check_slots_handler(update, context):
@@ -707,28 +751,27 @@ def decline_appointment_handler(update, context):
     update.message.reply_text(f"❌ Вы отклонили встречу: «{appt.event.name}»")
 
 
-
-def calendar_command(update: Update, context: CallbackContext):
+def calendar_command(update, context):
     user = update.effective_user
     appointments = get_appointments_by_telegram_id(user.id)
 
     if not appointments.exists():
         update.message.reply_text("🗓 Ваш календарь пуст.")
-        return ConversationHandler.END  # или просто return, если не в ConversationHandler
+        return
 
     lines = ["🗓 Ваши встречи:"]
-    for appt in appointments:
+    for appt in appointments.order_by("date", "time"):
         status_emoji = (
-            "✅" if appt.status == "подтверждено" else
-            "⏳" if appt.status == "ожидается" else
-            "❌"
+            "✅" if appt.status == "подтверждено"
+            else "⏳" if appt.status == "ожидается"
+            else "❌"
         )
         lines.append(
-            f"{status_emoji} {appt.date.strftime('%d.%m.%Y')} в {appt.time.strftime('%H:%M')} — {appt.details}"
+            f"{status_emoji} ID {appt.id}: {appt.date.strftime('%d.%m.%Y')} "
+            f"в {appt.time.strftime('%H:%M')} — {appt.details}"
         )
 
     update.message.reply_text("\n".join(lines))
-    return ConversationHandler.END
 
 
 def delete_appointment_confirm(update: Update, context: CallbackContext):
@@ -760,6 +803,17 @@ def delete_appointment_confirm(update: Update, context: CallbackContext):
     increment_cancelled(appointment.organizer)
 
     return ConversationHandler.END
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+def error_handler(update, context):
+    logger.error("Ошибка при обработке апдейта %s", update, exc_info=context.error)
 
 
 def main():
@@ -805,6 +859,7 @@ def main():
     dispatcher.add_handler(CommandHandler('decline',
                                           decline_appointment_handler))
     dispatcher.add_handler(CommandHandler("calendar", calendar_command))
+    dispatcher.add_error_handler(error_handler)
 
     updater.start_polling()
     updater.idle()
