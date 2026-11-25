@@ -4,6 +4,8 @@ import django  # type: ignore
 django.setup()
 
 import logging
+import csv
+from io import StringIO
 from datetime import date, datetime
 from telegram import Update
 from telegram.ext import (
@@ -53,6 +55,9 @@ conn = psycopg2.connect(
 ASK_DATE, ASK_TIME, ASK_PARTICIPANT, ASK_LOGIN = range(4)
 
 SELECT_APPOINTMENT_TO_DELETE = "select_appointment_to_delete"
+
+
+DJANGO_BASE_URL = "http://127.0.0.1:8000"
 
 
 class Calendar:
@@ -816,6 +821,150 @@ def error_handler(update, context):
     logger.error("Ошибка при обработке апдейта %s", update, exc_info=context.error)
 
 
+def share_event_handler(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    text = message.text or ""
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        message.reply_text("Формат: /share <ID> [off]")
+        return
+
+    appointment_id = int(parts[1])
+
+    try:
+        appt = Appointment.objects.get(id=appointment_id)
+    except Appointment.DoesNotExist:
+        message.reply_text(f"❌ Встреча с ID {appointment_id} не найдена.")
+        return
+
+    # Только владелец может менять публичность
+    if not can_manage_appointment(appt, user.id):
+        message.reply_text("❌ Вы можете делиться только своими встречами.")
+        return
+
+    make_public = not (len(parts) >= 3 and parts[2].lower() == "off")
+    appt.is_public = make_public
+    appt.save()
+
+    if make_public:
+        message.reply_text(
+            f"🌍 Встреча ID {appointment_id} теперь публичная: "
+            f"«{appt.event.name}» {appt.date.strftime('%d.%m.%Y')} в {appt.time.strftime('%H:%M')}"
+        )
+    else:
+        message.reply_text(f"🔒 Встреча ID {appointment_id} снова приватная.")
+
+
+def shared_events_handler(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    # Получаем публичные встречи, сортируем по дате.
+    public_appointments = Appointment.objects.filter(
+        is_public=True,
+        status__in=["подтверждено", "ожидается"]
+    ).order_by("date", "time")
+
+    if not public_appointments.exists():
+        message.reply_text("🌍 Сейчас нет публичных событий.")
+        return
+    lines = ["📋 Общие (публичные) события:"]
+    for appt in public_appointments:
+        # Показываем организатора, чтобы знать кто поделился
+        if appt.organizer and appt.organizer.username:
+            organizer_name = appt.organizer.username
+        elif appt.organizer:
+            organizer_name = appt.organizer.first_name or f"пользователь #{appt.organizer_id}"
+        else:
+            organizer_name = f"не указан (tg {appt.telegram_id or '—'})"
+        status_emoji = "✅" if appt.status == "подтверждено" else "⏳"
+
+        lines.append(
+            f"{status_emoji} ID {appt.id}: «{appt.event.name}» "
+            f"на {appt.date.strftime('%d.%m.%Y')} в {appt.time.strftime('%H:%M')}"
+            f"(от {organizer_name})"
+        )
+
+    message.reply_text("\n".join(lines))
+
+
+def export_events_handler(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    # Получаем только свои встречи
+    appointments = get_appointments_by_telegram_id(user.id)
+    if not appointments.exists():
+        message.reply_text("📄 У вас нет событий для выгрузки.")
+        return
+
+    # Готовим CSV в памяти
+    output = StringIO()
+    writer = csv.writer(output)
+
+    # Заголовки
+    writer.writerow([
+        "ID", "Название", "Дата", "Время", "Детали", "Статус",
+        "Организатор", "Участник (Telegram ID)", "Публичное"
+    ])
+
+    # Заполняем строки
+    for appt in appointments:
+        # Безопасное имя организатора (как мы уже научились)
+        if appt.organizer and appt.organizer.username:
+            organizer_name = appt.organizer.username
+        elif appt.organizer:
+            organizer_name = appt.organizer.first_name or f"пользователь #{appt.organizer_id}"
+        else:
+            organizer_name = "не указан"
+
+        writer.writerow([
+            appt.id,
+            appt.event.name,
+            appt.date.strftime("%Y-%m-%d"),
+            appt.time.strftime("%H:%M"),
+            appt.details,
+            appt.status,
+            organizer_name,
+            user.id,
+            "Да" if appt.is_public else "Нет"
+        ])
+
+    csv_data = output.getvalue()
+    output.close()
+
+    # Отправляем файл в чат
+    context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=csv_data.encode("utf-8"),
+        filename="my_events.csv",
+        caption="📥 Ваша выгрузка событий (CSV)"
+    )
+
+
+def export_link_handler(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    try:
+        TelegramProfile.objects.get(telegram_id=user.id)
+    except TelegramProfile.DoesNotExist:
+        message.reply_text("❌ Сначала зарегистрируйтесь командой /register.")
+        return
+
+    csv_url = f"{DJANGO_BASE_URL}/events/export/?telegram_id={user.id}"
+    json_url = f"{DJANGO_BASE_URL}/events/export/json/?telegram_id={user.id}"
+
+    message.reply_text(
+        "📥 Ваши события для выгрузки:\n\n"
+        f"CSV: {csv_url}\n"
+        f"JSON: {json_url}\n\n"
+        "Откройте ссылку в браузере — файл скачается автоматически."
+    )
+
+
 def main():
     updater = Updater(token=API_TOKEN)
     dispatcher = updater.dispatcher
@@ -859,6 +1008,10 @@ def main():
     dispatcher.add_handler(CommandHandler('decline',
                                           decline_appointment_handler))
     dispatcher.add_handler(CommandHandler("calendar", calendar_command))
+    dispatcher.add_handler(CommandHandler("share", share_event_handler))
+    dispatcher.add_handler(CommandHandler("shared", shared_events_handler))
+    dispatcher.add_handler(CommandHandler("export_link", export_link_handler))
+    dispatcher.add_handler(CommandHandler("export", export_events_handler))
     dispatcher.add_error_handler(error_handler)
 
     updater.start_polling()

@@ -42,6 +42,7 @@ class Appointment(models.Model):
     details = models.TextField(blank=True)
     status = models.CharField(max_length=40)
     telegram_id = models.BigIntegerField(null=True, blank=True)
+    is_public = models.BooleanField(default=False, verbose_name="Публичное событие")
 
     def __str__(self):
         return (f"{self.user.username} - {self.event} -"

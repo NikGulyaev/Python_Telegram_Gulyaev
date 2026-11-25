@@ -52,9 +52,9 @@ class BotStatisticsAdmin(admin.ModelAdmin):
 @admin.register(Appointment)
 class AppointmentAdmin(admin.ModelAdmin):
     list_display = (
-        'organizer', 'user', 'event', 'date', 'time', 'status'
+        'organizer', 'user', 'event', 'date', 'time', 'status', 'is_public'
         )
-    list_filter = ('status', 'date')
+    list_filter = ('status', 'date', 'is_public')
     search_fields = ("organizer__username", "user__username")
 
 
