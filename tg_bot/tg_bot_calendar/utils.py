@@ -1,8 +1,14 @@
 from datetime import datetime, timedelta
+from django.db import transaction
 from django.utils import timezone  # type: ignore
 from django.core.exceptions import ValidationError  # type: ignore
 from telegram import Bot
-from .models import Appointment, BotStatistics, TelegramProfile
+from .models import (
+    Appointment,
+    BotStatistics,
+    TelegramProfile,
+    UserActivityStats
+    )
 
 
 MEETING_DURATION = timedelta(hours=1)
@@ -119,6 +125,8 @@ def invite_to_event(
             time=time,
         )
 
+    increment_created(organizer_user)
+
     return appointment
 
 
@@ -155,3 +163,47 @@ def get_django_user_by_telegram_id(telegram_id):
         return profile.user
     except TelegramProfile.DoesNotExist:
         return None
+
+
+@transaction.atomic
+def increment_created(user):
+    """Увеличивает счетчик созданных событий у пользователя"""
+    stats, _ = UserActivityStats.objects.get_or_create(user=user)
+    stats.created_count += 1
+    stats.save()
+
+
+@transaction.atomic
+def increment_edited(user):
+    """Увеличивает счетчик редактирований"""
+    stats, _ = UserActivityStats.objects.get_or_create(user=user)
+    stats.edited_count += 1
+    stats.save()
+
+
+@transaction.atomic
+def increment_cancelled(user):
+    """Увеличивает счетчик отмен"""
+    stats, _ = UserActivityStats.objects.get_or_create(user=user)
+    stats.cancelled_count += 1
+    stats.save()
+
+
+def get_appointments_by_telegram_id(telegram_id: int):
+    """Возвращает все встречи пользователя по его telegram_id."""
+    try:
+        profile = TelegramProfile.objects.get(telegram_id=telegram_id)
+        return Appointment.objects.filter(user=profile.user)
+    except TelegramProfile.DoesNotExist:
+        return Appointment.objects.none()
+
+
+def can_manage_appointment(appointment: Appointment, telegram_id: int) -> bool:
+    """Проверяет, может ли пользователь с данным telegram_id управлять встречей."""
+    try:
+        profile = TelegramProfile.objects.get(telegram_id=telegram_id)
+        user = profile.user
+        # Пользователь может управлять, если он организатор ИЛИ участник
+        return appointment.organizer == user or appointment.user == user
+    except TelegramProfile.DoesNotExist:
+        return False

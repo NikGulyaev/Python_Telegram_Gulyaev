@@ -74,3 +74,15 @@ class TelegramProfile(models.Model):
 
     def __str__(self):
         return f"{self.user.username} ({self.telegram_id})"
+
+
+class UserActivityStats(models.Model):
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='activity_stats'
+        )
+    created_count = models.PositiveIntegerField(default=0)
+    edited_count = models.PositiveIntegerField(default=0)
+    cancelled_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"Stats for {self.user.username}"

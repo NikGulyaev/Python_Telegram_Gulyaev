@@ -5,13 +5,14 @@ django.setup()
 
 
 from datetime import date, datetime
-
+from telegram import Update
 from telegram.ext import (
     Updater,
     CommandHandler,
     MessageHandler,
     Filters,
-    ConversationHandler
+    ConversationHandler,
+    CallbackContext
     )
 import psycopg2  # type: ignore
 from django.contrib.auth.models import User  # type: ignore
@@ -29,7 +30,12 @@ from tg_bot_calendar.utils import (
     get_or_create_daily_stats,
     get_busy_slots,
     invite_to_event,
-    get_django_user_by_telegram_id
+    get_django_user_by_telegram_id,
+    get_appointments_by_telegram_id,
+    can_manage_appointment,
+    increment_cancelled,
+    increment_created,
+    increment_edited,
     )
 from tg_bot_calendar.models import Event, Appointment, TelegramProfile
 
@@ -44,6 +50,8 @@ conn = psycopg2.connect(
 )
 
 ASK_DATE, ASK_TIME, ASK_PARTICIPANT, ASK_LOGIN = range(4)
+
+SELECT_APPOINTMENT_TO_DELETE = "select_appointment_to_delete"
 
 
 class Calendar:
@@ -650,15 +658,24 @@ def accept_appointment_handler(update, context):
 
     if not pending.exists():
         update.message.reply_text(
-            "У вас нет приглашений, ожидающих подтверждения.")
+            "У вас нет приглашений, ожидающих подтверждения."
+        )
         return
 
     appt = pending.first()
+
+    # Проверка прав: подтверждать может только участник (или организатор)
+    if not can_manage_appointment(appt, user.id):
+        update.message.reply_text("❌ Вы не можете подтверждать эту встречу.")
+        return
+
     appt.status = 'подтверждено'
     appt.save()
 
-    update.message.reply_text(f"✅ Вы подтвердили встречу: «{appt.event.name}»"
-                              f"на {appt.date} в {appt.time}")
+    update.message.reply_text(
+        f"✅ Вы подтвердили встречу: «{appt.event.name}» "
+        f"на {appt.date} в {appt.time}"
+    )
 
 
 def decline_appointment_handler(update, context):
@@ -671,13 +688,78 @@ def decline_appointment_handler(update, context):
     if not pending.exists():
         update.message.reply_text(
             "У вас нет приглашений, ожидающих подтверждения."
-            )
+        )
         return
 
     appt = pending.first()
+
+    # Проверка прав: отклонять может только участник (или организатор)
+    if not can_manage_appointment(appt, user.id):
+        update.message.reply_text("❌ Вы не можете отменять эту встречу.")
+        return
+
     appt.status = 'отменено'
     appt.save()
+
+    # Учёт статистики: отмену засчитываем тому, кто её совершил (участнику)
+    increment_cancelled(appt.user)
+
     update.message.reply_text(f"❌ Вы отклонили встречу: «{appt.event.name}»")
+
+
+
+def calendar_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    appointments = get_appointments_by_telegram_id(user.id)
+
+    if not appointments.exists():
+        update.message.reply_text("🗓 Ваш календарь пуст.")
+        return ConversationHandler.END  # или просто return, если не в ConversationHandler
+
+    lines = ["🗓 Ваши встречи:"]
+    for appt in appointments:
+        status_emoji = (
+            "✅" if appt.status == "подтверждено" else
+            "⏳" if appt.status == "ожидается" else
+            "❌"
+        )
+        lines.append(
+            f"{status_emoji} {appt.date.strftime('%d.%m.%Y')} в {appt.time.strftime('%H:%M')} — {appt.details}"
+        )
+
+    update.message.reply_text("\n".join(lines))
+    return ConversationHandler.END
+
+
+def delete_appointment_confirm(update: Update, context: CallbackContext):
+    """Пользователь выбрал встречу для удаления — проверяем права и удаляем."""
+    appointment_id = context.user_data.get("appointment_id")
+    if not appointment_id:
+        update.message.reply_text("❌ Не удалось найти встречу для удаления.")
+        return ConversationHandler.END
+
+    try:
+        appointment = Appointment.objects.get(id=appointment_id)
+    except Appointment.DoesNotExist:
+        update.message.reply_text("❌ Встреча не найдена (возможно, уже удалена).")
+        return ConversationHandler.END
+
+    # --- ГЛАВНОЕ: проверка прав ---
+    if not can_manage_appointment(appointment, update.effective_user.id):
+        update.message.reply_text(
+            "❌ Вы не можете удалять эту встречу: вы не организатор и не участник."
+        )
+        return ConversationHandler.END
+    # ----------------------------
+
+    # Если права есть — удаляем и обновляем статистику
+    appointment.delete()
+    update.message.reply_text("✅ Встреча успешно удалена.")
+
+    # Считаем отмену для организатора (логика: кто создал — тот и «отменяет»)
+    increment_cancelled(appointment.organizer)
+
+    return ConversationHandler.END
 
 
 def main():
@@ -722,6 +804,7 @@ def main():
                                           accept_appointment_handler))
     dispatcher.add_handler(CommandHandler('decline',
                                           decline_appointment_handler))
+    dispatcher.add_handler(CommandHandler("calendar", calendar_command))
 
     updater.start_polling()
     updater.idle()
