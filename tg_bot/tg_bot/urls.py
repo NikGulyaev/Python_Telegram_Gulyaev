@@ -19,5 +19,6 @@ from django.urls import path, include
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path("api/", include("tg_bot_calendar.api_urls")),
     path("", include("tg_bot_calendar.urls")),
 ]
