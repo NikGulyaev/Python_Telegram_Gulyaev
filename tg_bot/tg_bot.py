@@ -121,16 +121,28 @@ class Calendar:
 
     # Создание события с привязкой к пользователю
     def create_event(self, telegram_id, name, date, time, details):
-        with self.conn.cursor() as cur:
-            insert_query = """
-                INSERT INTO events (name, date, time, details, telegram_id)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id;
-            """
-            cur.execute(insert_query, (name, date, time, details, telegram_id))
-            row = cur.fetchone()
-            self.conn.commit()
-            return row[0] if row else None
+        profile = TelegramProfile.objects.get(telegram_id=telegram_id)
+
+        # Парсим строки в настоящие date/time — иначе в базу уйдут строки, 
+        # и strftime('%d.%m.%Y') в /calendar упадёт
+        parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+        parsed_time = datetime.strptime(time, "%H:%M").time()
+
+        event = Event.objects.create(
+            name=name,
+            date=parsed_date,
+            time=parsed_time,
+            )
+        appointment = Appointment.objects.create(
+            organizer=profile.user,
+            user=profile.user,
+            event=event,
+            date=parsed_date,
+            time=parsed_time,
+            details=details,
+            status="ожидается",
+        )
+        return appointment.id
 
     # Получение событий только для этого пользователя
     def list_events(self, telegram_id):
