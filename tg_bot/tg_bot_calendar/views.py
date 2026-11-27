@@ -1,4 +1,4 @@
-from django.shortcuts import render
+
 
 # Create your views here.
 import csv
@@ -16,7 +16,8 @@ def _get_appointments_for(telegram_id: int):
     except TelegramProfile.DoesNotExist:
         return None  # пользователь не найден
     # Свои встречи: он участник или организатор
-    return Appointment.objects.filter(user=profile.user) | Appointment.objects.filter(organizer=profile.user)
+    return (Appointment.objects.filter(user=profile.user) |
+            Appointment.objects.filter(organizer=profile.user))
 
 
 @require_GET

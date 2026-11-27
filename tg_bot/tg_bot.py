@@ -36,7 +36,6 @@ from tg_bot_calendar.utils import (
     get_appointments_by_telegram_id,
     can_manage_appointment,
     increment_cancelled,
-    increment_created,
     increment_edited,
     MEETING_DURATION,
     )
@@ -123,7 +122,7 @@ class Calendar:
     def create_event(self, telegram_id, name, date, time, details):
         profile = TelegramProfile.objects.get(telegram_id=telegram_id)
 
-        # Парсим строки в настоящие date/time — иначе в базу уйдут строки, 
+        # Парсим строки в настоящие date/time — иначе в базу уйдут строки,
         # и strftime('%d.%m.%Y') в /calendar упадёт
         parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
         parsed_time = datetime.strptime(time, "%H:%M").time()
@@ -202,6 +201,21 @@ class Calendar:
 calendar = Calendar(conn)
 
 
+def upsert_profile(django_user, telegram_id, telegram_username, first_name):
+    """Создаёт или обновляет TelegramProfile по Django-пользователю.
+
+    Возвращает (profile, created).
+    """
+    return TelegramProfile.objects.update_or_create(
+        user=django_user,
+        defaults={
+            "telegram_id": telegram_id,
+            "username": telegram_username,
+            "first_name": first_name,
+        },
+    )
+
+
 def start(update, context):
     update.message.reply_text(
         "Привет! Я Бот‑календарь.\n"
@@ -236,7 +250,7 @@ def register_save_login(update, context):
     """Сохраняет профиль, привязывая telegram_id к указанному логину."""
     user = update.effective_user
     raw_login = (update.message.text or "").strip()
-    login = raw_login.lstrip("@")  # на всякий случай убираем @
+    login = raw_login.lstrip("@")
 
     if not login:
         update.message.reply_text("❌ Логин не может быть пустым. Попробуйте ещё раз или /cancel.")
@@ -245,17 +259,12 @@ def register_save_login(update, context):
     try:
         django_user = User.objects.get(username=login)
     except User.DoesNotExist:
-        update.message.reply_text(f"❌ Пользователь с логином «{login}» не найден. Попробуйте ещё раз или /cancel.")
+        update.message.reply_text(f"❌ Пользователь с логином «{login}» не найден."
+                                  f" Попробуйте ещё раз или /cancel.")
         return ASK_LOGIN
 
-    # Создаём или обновляем профиль
-    profile, created = TelegramProfile.objects.update_or_create(
-        user=django_user,
-        defaults={
-            "telegram_id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
-        },
+    profile, created = upsert_profile(
+        django_user, user.id, user.username, user.first_name,
     )
 
     if created:
@@ -280,14 +289,8 @@ def register_handler(update, context):
             )
         return ConversationHandler.END
 
-    # Создаём или обновляем профиль
-    profile, created = TelegramProfile.objects.update_or_create(
-        user=django_user,
-        defaults={
-            "telegram_id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
-        },
+    profile, created = upsert_profile(
+        django_user, user.id, user.username, user.first_name,
     )
 
     if created:
@@ -396,82 +399,125 @@ def get_event_handler(update, context):
     )
 
 
-def edit_event_handler(update, context):
-    user = update.effective_user
+def parse_edit_args(parts):
+    """Разбирает аргументы команды /edit_event.
 
-    text = update.message.text or ""
-    parts = text.split()
+    Возвращает (values_dict, None) или (None, error_message).
+    """
     if len(parts) < 6:
-        update.message.reply_text(
-            "Формат: /edit_event <id> <название> <дата(YYYY-MM-DD)> <время(HH:MM)> <описание>"
-        )
-        return
-
+        return None, ("Формат: /edit_event <id> <название> <дата(YYYY-MM-DD)> "
+                      "<время(HH:MM)> <описание>")
     try:
         appointment_id = int(parts[1])
     except ValueError:
-        update.message.reply_text("ID должен быть целым числом.")
+        return None, "ID должен быть целым числом."
+    try:
+        new_date = datetime.strptime(parts[3], "%Y-%m-%d").date()
+        new_time = datetime.strptime(parts[4], "%H:%M").time()
+    except ValueError:
+        return None, "❌ Неверный формат даты/времени. Пример: 2026-12-01 14:30"
+
+    values = {
+        "id": appointment_id,
+        "name": parts[2],
+        "date": new_date,
+        "time": new_time,
+        "details": " ".join(parts[5:]),
+    }
+    return values, None
+
+
+def find_slot_conflict(participant, new_date, new_time, exclude_id):
+    """Ищет пересечение нового слота с существующими встречами участника.
+
+    Возвращает объект Appointment (если есть конфликт) или None.
+    """
+    new_start = datetime.combine(new_date, new_time)
+    new_end = new_start + MEETING_DURATION
+
+    for other in Appointment.objects.filter(
+        user=participant,
+        date=new_date,
+        status__in=["ожидается", "подтверждено"],
+    ).exclude(id=exclude_id):
+        other_start = datetime.combine(other.date, other.time)
+        other_end = other_start + MEETING_DURATION
+        if new_start < other_end and new_end > other_start:
+            return other
+    return None
+
+
+def format_slot_conflict_message(appt, conflict, new_date):
+    start = datetime.combine(conflict.date, conflict.time)
+    end = start + MEETING_DURATION
+    return (
+        f"❌ Участник {appt.user.username} уже занят "
+        f"с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}"
+        f" {new_date.strftime('%d.%m.%Y')}."
+    )
+
+
+def build_edit_success_message(appointment_id, name, new_date, new_time, details):
+    return (
+        f"✅ Встреча ID {appointment_id} обновлена:\n"
+        f"📅 {new_date.strftime('%d.%m.%Y')} в {new_time.strftime('%H:%M')}\n"
+        f"📝 {name} — {details}"
+    )
+
+
+def edit_event_handler(update, context):
+    user = update.effective_user
+    parts = (update.message.text or "").split()
+
+    # 1. Парсинг аргументов
+    values, error = parse_edit_args(parts)
+    if error:
+        update.message.reply_text(error)
         return
 
+    appointment_id = values["id"]
+    new_date, new_time = values["date"], values["time"]
+
+    # 2. Получение встречи
     try:
         appt = Appointment.objects.select_related("event").get(id=appointment_id)
     except Appointment.DoesNotExist:
         update.message.reply_text(f"❌ Встреча с ID {appointment_id} не найдена.")
         return
 
-    # Проверка прав: только организатор или участник
+    # 3. Проверка прав
     if not can_manage_appointment(appt, user.id):
         update.message.reply_text("❌ Вы не можете редактировать чужую встречу.")
         return
 
-    # Разбор новых значений
-    name = parts[2]
-    try:
-        new_date = datetime.strptime(parts[3], "%Y-%m-%d").date()
-        new_time = datetime.strptime(parts[4], "%H:%M").time()
-    except ValueError:
-        update.message.reply_text("❌ Неверный формат даты/времени. Пример: 2026-12-01 14:30")
-        return
-    details = " ".join(parts[5:])
-
-    # Если меняется дата/время — проверяем, не занят ли новый слот участника
+    # 4. Проверка пересечения слотов
     if new_date != appt.date or new_time != appt.time:
-        new_start = datetime.combine(new_date, new_time)
-        new_end = new_start + MEETING_DURATION
-        for other in Appointment.objects.filter(
-            user=appt.user,
-            date=new_date,
-            status__in=["ожидается", "подтверждено"],
-        ).exclude(id=appt.id):
-            other_start = datetime.combine(other.date, other.time)
-            other_end = other_start + MEETING_DURATION
-            if new_start < other_end and new_end > other_start:
-                update.message.reply_text(
-                    f"❌ Участник {appt.user.username} уже занят "
-                    f"с {other_start.strftime('%H:%M')} до {other_end.strftime('%H:%M')} {new_date.strftime('%d.%m.%Y')}."
-                )
-                return
+        conflict = find_slot_conflict(appt.user, new_date, new_time, appt.id)
+        if conflict:
+            update.message.reply_text(format_slot_conflict_message(appt, conflict, new_date))
+            return
 
-    # Применяем изменения
-    appt.event.name = name
-    appt.event.date = new_date
-    appt.event.time = new_time
-    appt.event.save()
+    # 5. Применение изменений
+    if appt.event:
+        appt.event.name = values["name"]
+        appt.event.date = new_date
+        appt.event.time = new_time
+        appt.event.save()
 
     appt.date = new_date
     appt.time = new_time
-    appt.details = details
+    appt.details = values["details"]
     appt.save()
 
-    # Статистика: редактирование засчитываем тому, кто его сделал
+    # 6. Статистика
     editor = get_django_user_by_telegram_id(user.id)
     if editor:
         increment_edited(editor)
 
     update.message.reply_text(
-        f"✅ Встреча ID {appointment_id} обновлена:\n"
-        f"📅 {new_date.strftime('%d.%m.%Y')} в {new_time.strftime('%H:%M')}\n"
-        f"📝 {name} — {details}"
+        build_edit_success_message(
+            appointment_id, values["name"], new_date, new_time, values["details"]
+        )
     )
 
 
@@ -603,53 +649,65 @@ def ask_time(update, context):
     return ASK_PARTICIPANT
 
 
+def resolve_participant(text, organizer, requester_tg_id):
+    """Возвращает (participant_user, participant_tg_id, None)
+    или (None, None, error_message)"""
+    if text.lower() == "я":
+        return organizer, requester_tg_id, None
+
+    participant_username = text.lstrip("@")
+    try:
+        participant = User.objects.get(username=participant_username)
+    except User.DoesNotExist:
+        return None, None, (
+            f"❌ Пользователь с логином «{participant_username}» не найден.\n"
+            "Проверьте правильность написания или используйте «я» для себя."
+        )
+
+    try:
+        profile = TelegramProfile.objects.get(user=participant)
+        return participant, profile.telegram_id, None
+    except TelegramProfile.DoesNotExist:
+        return participant, None, None
+
+
+def build_meeting_created_message(organizer, participant, meeting_date,
+                                  meeting_time, appointment, participant_tg_id):
+    msg = (
+        "✅ Встреча создана!\n"
+        f"📅 {meeting_date.strftime('%d.%m.%Y')} в {meeting_time.strftime('%H:%M')}\n"
+        f"👥 Организатор: {organizer.username}\n"
+        f"👥 Участник: {participant.username}\n"
+        f"📋 Статус: {appointment.status}"
+    )
+    if participant_tg_id:
+        msg += "\n📩 Участнику отправлено приглашение."
+    else:
+        msg += "\n⚠️ У участника нет профиля — уведомление не отправлено."
+    return msg
+
+
 def ask_participant(update, context):
-    """Получаем участника и создаём встречу, используя TelegramProfile для привязки."""
     text = (update.message.text or "").strip()
     user = update.effective_user
 
-    # 1. Получаем организатора через профиль по telegram_id
-    # Это работает даже если у пользователя нет username в Telegram
     organizer = get_django_user_by_telegram_id(user.id)
-
     if organizer is None:
         update.message.reply_text(
-            "❌ Ваш профиль не зарегистрирован. Сначала выполните /register и укажите логин (например, admin)."
+            "❌ Ваш профиль не зарегистрирован. "
+            "Сначала выполните /register и укажите логин (например, admin)."
         )
         context.user_data.clear()
         return ConversationHandler.END
 
-    # 2. Выбор участника: «я» или @username
-    if text.lower() == "я":
-        participant = organizer
-        # Если участник — это сам организатор, его telegram_id точно есть
-        participant_tg_id = user.id
-    else:
-        participant_username = text.lstrip("@")
-
-        # Ищем Django-пользователя по логину (как раньше), но теперь это только для поиска участника,
-        # а не для привязки к боту.
-        try:
-            participant = User.objects.get(username=participant_username)
-        except User.DoesNotExist:
-            update.message.reply_text(
-                f"❌ Пользователь с логином «{participant_username}» не найден.\n"
-                "Проверьте правильность написания или используйте «я» для себя."
-            )
-            return ASK_PARTICIPANT
-
-        # Пытаемся найти telegram_id участника через его профиль
-        # Если профиля нет — участник не регистрировался, уведомления ему не придут
-        try:
-            profile = TelegramProfile.objects.get(user=participant)
-            participant_tg_id = profile.telegram_id
-        except TelegramProfile.DoesNotExist:
-            participant_tg_id = None
+    participant, participant_tg_id, error = resolve_participant(text, organizer, user.id)
+    if error:
+        update.message.reply_text(error)
+        return ASK_PARTICIPANT
 
     meeting_date = context.user_data.get("meeting_date")
     meeting_time = context.user_data.get("meeting_time")
 
-    # Создаём событие
     event = Event.objects.create(
         name=f"Встреча: {organizer.username} — {participant.username}",
         date=meeting_date,
@@ -668,19 +726,9 @@ def ask_participant(update, context):
             bot=context.bot,
         )
 
-        msg = (
-            f"✅ Встреча создана!\n"
-            f"📅 {meeting_date.strftime('%d.%m.%Y')} в {meeting_time.strftime('%H:%M')}\n"
-            f"👥 Организатор: {organizer.username}\n"
-            f"👥 Участник: {participant.username}\n"
-            f"📋 Статус: {appointment.status}"
+        msg = build_meeting_created_message(
+            organizer, participant, meeting_date, meeting_time, appointment, participant_tg_id
         )
-
-        if participant_tg_id:
-            msg += "\n📩 Участнику отправлено приглашение."
-        else:
-            msg += "\n⚠️ У участника нет профиля — уведомление не отправлено."
-
         update.message.reply_text(msg)
 
     except ValidationError as e:
@@ -793,7 +841,17 @@ def calendar_command(update, context):
 
 def delete_appointment_confirm(update: Update, context: CallbackContext):
     """Пользователь выбрал встречу для удаления — проверяем права и удаляем."""
-    appointment_id = context.user_data.get("appointment_id")
+    user = update.effective_user
+    if not user:
+        update.message.reply_text("❌ Не удалось определить пользователя.")
+        return ConversationHandler.END
+
+    user_data = context.user_data
+    if not user_data:
+        update.message.reply_text("❌ Не удалось найти данные о встрече.")
+        return ConversationHandler.END
+
+    appointment_id = user_data.get("appointment_id")
     if not appointment_id:
         update.message.reply_text("❌ Не удалось найти встречу для удаления.")
         return ConversationHandler.END
@@ -805,20 +863,14 @@ def delete_appointment_confirm(update: Update, context: CallbackContext):
         return ConversationHandler.END
 
     # --- ГЛАВНОЕ: проверка прав ---
-    if not can_manage_appointment(appointment, update.effective_user.id):
+    if not can_manage_appointment(appointment, user.id):
         update.message.reply_text(
             "❌ Вы не можете удалять эту встречу: вы не организатор и не участник."
         )
         return ConversationHandler.END
-    # ----------------------------
 
-    # Если права есть — удаляем и обновляем статистику
     appointment.delete()
     update.message.reply_text("✅ Встреча успешно удалена.")
-
-    # Считаем отмену для организатора (логика: кто создал — тот и «отменяет»)
-    increment_cancelled(appointment.organizer)
-
     return ConversationHandler.END
 
 
@@ -834,8 +886,8 @@ def error_handler(update, context):
 
 
 def share_event_handler(update, context):
-    message = update.effective_message
     user = update.effective_user
+    message = update.effective_message
 
     text = message.text or ""
     parts = text.split()
@@ -871,7 +923,6 @@ def share_event_handler(update, context):
 
 def shared_events_handler(update, context):
     message = update.effective_message
-    user = update.effective_user
 
     # Получаем публичные встречи, сортируем по дате.
     public_appointments = Appointment.objects.filter(
@@ -1002,7 +1053,8 @@ def main():
                 MessageHandler(Filters.text & ~Filters.command, register_save_login)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_meeting)],  # важно: используй тот же cancel, что и у create_meeting
+        fallbacks=[CommandHandler("cancel", cancel_meeting)],  # важно: используй тот же cancel,
+                                                               # что и у create_meeting
     )
     dispatcher.add_handler(register_conv)
 
