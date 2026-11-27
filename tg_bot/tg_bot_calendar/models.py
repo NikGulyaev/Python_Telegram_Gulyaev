@@ -8,6 +8,9 @@ class Event(models.Model):
     date = models.DateField()
     time = models.TimeField()
 
+    def __str__(self):
+        return f"{self.name} ({self.date} {self.time})"
+
 
 class BotStatistics(models.Model):
     date = models.DateField()

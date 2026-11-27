@@ -4,3 +4,5 @@ psycopg2-binary==2.9.12
 python-dotenv==1.2.4
 gunicorn==23.0.0
 djangorestframework==3.18.3
+pytest==9.2.0
+pytest-django==4.14.0
