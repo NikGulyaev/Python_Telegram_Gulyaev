@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 secrets.py
 config.py
+.pytest_cache/
